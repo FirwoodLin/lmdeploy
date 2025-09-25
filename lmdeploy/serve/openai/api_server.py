@@ -357,6 +357,9 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     preserve_cache = json_request.pop('preserve_cache', False)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
+    encoder_result = json_request.pop('encoder_result', None)
+    if encoder_result:
+        logger.info(f'Using encoder result from request: {encoder_result}')
 
     if request.session_id == -1:
         VariableInterface.session_id += 1
