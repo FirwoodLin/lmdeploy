@@ -111,6 +111,59 @@ class NodeManager:
         self.pd_connection_pool = PDConnectionPool()
         self.ep_connection_pool = EPDConnectionPool()
         self.dummy_prefill = False
+        
+        self.role_to_nodes_getter = {
+            EngineRole.Prefill: lambda: self.prefill_nodes,
+            EngineRole.Decode: lambda: self.decode_nodes,
+            EngineRole.Encoder: lambda: self.encoder_nodes,
+            EngineRole.Hybrid: lambda: self.hybrid_nodes,
+        }
+
+        self.connection_specs = [
+            {
+                'roles': set({EngineRole.Prefill, EngineRole.Decode}),
+                'pool': self.pd_connection_pool,
+                'message': PDConnectionMessage,
+                'params': {
+                    EngineRole.Prefill: 'p_url',
+                    EngineRole.Decode: 'd_url'
+                }
+            },
+            {
+                'roles': set({EngineRole.Encoder, EngineRole.Hybrid}),
+                'pool': self.ep_connection_pool,
+                'message': EPDConnectionMessage,
+                'params': {
+                    EngineRole.Encoder: 'e_url',
+                    EngineRole.Hybrid: 'pd_url'
+                }
+            }
+        ]
+                # ---------- 新增逻辑：启动时健康度检测 START ----------
+        unhealthy_nodes_to_remove = []
+        # 创建键的副本进行迭代，因为我们可能会在循环中修改字典
+        for node_url in list(self.nodes.keys()):
+            try:
+                health_check_url = f'{node_url}/health'
+                # 使用超时机制以防节点无响应
+                response = requests.get(health_check_url, timeout=5)
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Node {node_url} failed startup health check with status {response.status_code}. Removing.")
+                    unhealthy_nodes_to_remove.append(node_url)
+            except requests.exceptions.RequestException as e:
+                # 捕获连接错误、超时等异常
+                logger.warning(f"Node {node_url} is unreachable during startup health check: {e}. Removing.")
+                unhealthy_nodes_to_remove.append(node_url)
+
+        # 从节点列表中移除不健康的节点
+        if unhealthy_nodes_to_remove:
+            for node_url in unhealthy_nodes_to_remove:
+                self.nodes.pop(node_url)
+            # 将移除操作同步到配置文件
+            logger.info("Updating config file after removing unhealthy nodes from startup check.")
+            self.update_config_file()
+        # ---------- 新增逻辑：启动时健康度检测 END ----------
 
     def get_nodes(self, role: EngineRole) -> Dict:
         items = list(self.nodes.items())
@@ -145,8 +198,66 @@ class NodeManager:
                 },
                           config_file,
                           indent=2)
+    async def establish_peer_connections_delayed(self, node_url: str, status: Status):
+        """Waits for a delay and then establishes connections with peer nodes.
+        This is intended to be run as a background task.
+        """
+        delay = 15
+        logger.info(f'Connection setup for node {node_url} scheduled in {delay} seconds.')
+        await asyncio.sleep(delay)
 
-    def add(self, node_url: str, status: Optional[Status] = None):
+        logger.info(f'Proxy begins auto-connecting for node {node_url}.')
+        new_node_role = status.role
+        connect_tasks = []
+        logger.info(f"Node {node_url} with role {new_node_role} added. Checking for connection rules.")
+
+        # Iterate through connection specifications
+        for spec in self.connection_specs:
+            # Check if the new node's role is part of the current rule
+            logger.info(f"matching, {spec['roles']=}")
+            
+            if new_node_role in spec['roles']:
+                # Find the target role to connect to
+                target_role = (spec['roles'] - {new_node_role}).pop()
+                logger.info(f"{new_node_role=},{target_role=}")
+                # Get the list of existing target nodes
+                target_nodes_getter = self.role_to_nodes_getter.get(target_role)
+                if not target_nodes_getter:
+                    continue
+                
+                target_node_urls = target_nodes_getter()
+
+                # Create connection tasks for each existing target node
+                for existing_node_url in target_node_urls:
+                    if existing_node_url == node_url: # A node should not connect to itself
+                        continue
+
+                    # Prepare parameters for the connection message dynamically
+                    message_params = {
+                        spec['params'][new_node_role]: node_url,
+                        spec['params'][target_role]: existing_node_url
+                    }
+                    
+                    logger.info(f"Creating connection task for {new_node_role.name} -> {target_role.name}: {message_params}")
+
+                    # Create the message object and the connection task
+                    connection_message = spec['message'](
+                        protocol=self.migration_protocol,
+                        rdma_config=self.rdma_config,
+                        **message_params
+                    )
+                    task = spec['pool'].connect(connection_message)
+                    connect_tasks.append(task)
+
+        if connect_tasks:
+            try:
+                await asyncio.gather(*connect_tasks)
+                logger.info(f"Successfully established {len(connect_tasks)} connections for node {node_url} in background.")
+            except Exception as e:
+                logger.error(f"Failed to establish background connections for node {node_url}: {e}")
+        else:
+            logger.info(f"No new background connections required for node {node_url} based on current rules.")
+    async  def add(self, node_url: str, status: Optional[Status] = None):
         """Add a node to the manager.
 
         Args:
@@ -163,16 +274,70 @@ class NodeManager:
             self.remove(node_url)
             self.nodes[node_url] = status
             self.update_config_file()
-            return
-        try:
-            from lmdeploy.serve.openai.api_client import APIClient
-            client = APIClient(api_server_url=node_url)
-            status.models = client.available_models
-            self.nodes[node_url] = status
-        except requests.exceptions.RequestException as e:  # noqa
-            logger.error(f'exception happened when adding node {node_url}, {e}')
-            return self.handle_api_timeout(node_url)
-        self.update_config_file()
+        else:
+            try:
+                from lmdeploy.serve.openai.api_client import APIClient
+                client = APIClient(api_server_url=node_url)
+                status.models = client.available_models
+                self.nodes[node_url] = status
+            except requests.exceptions.RequestException as e:  # noqa
+                logger.error(f'exception happened when adding node {node_url}, {e}')
+                return self.handle_api_timeout(node_url)
+            self.update_config_file()
+        return None, status
+        # # if self.serving_strategy == ServingStrategy.Hybrid:
+        # logger.info(f'proxy begin auto connect!')
+        
+        # new_node_role = status.role
+        # connect_tasks = []
+        # logger.info(f"Node {node_url} with role {new_node_role} added. Checking for connection rules.")
+
+        # # Iterate through connection specifications
+        # for spec in  self.connection_specs  :
+        #     # Check if the new node's role is part of the current rule
+        #     logger.info(f"matching, {spec['roles']=}")
+            
+        #     if new_node_role in spec['roles']:
+        #         # Find the target role to connect to
+        #         target_role = (spec['roles'] - {new_node_role}).pop()
+        #         logger.info(f"{new_node_role=},{target_role=}")
+        #         # Get the list of existing target nodes
+        #         target_nodes_getter = self.role_to_nodes_getter.get(target_role)
+        #         if not target_nodes_getter:
+        #             continue
+                
+        #         target_node_urls = target_nodes_getter()
+
+        #         # Create connection tasks for each existing target node
+        #         for existing_node_url in target_node_urls:
+        #             if existing_node_url == node_url: # A node should not connect to itself
+        #                 continue
+
+        #             # Prepare parameters for the connection message dynamically
+        #             message_params = {
+        #                 spec['params'][new_node_role]: node_url,
+        #                 spec['params'][target_role]: existing_node_url
+        #             }
+                    
+        #             logger.info(f"Creating connection task for {new_node_role.name} -> {target_role.name}: {message_params}")
+
+        #             # Create the message object and the connection task
+        #             connection_message = spec['message'](
+        #                 protocol=self.migration_protocol,
+        #                 rdma_config=self.rdma_config,
+        #                 **message_params
+        #             )
+        #             task = spec['pool'].connect(connection_message)
+        #             connect_tasks.append(task)
+
+        # if connect_tasks:
+        #     try:
+        #         await asyncio.gather(*connect_tasks)
+        #         logger.info(f"Successfully established {len(connect_tasks)} connections for node {node_url}.")
+        #     except Exception as e:
+        #         logger.error(f"Failed to establish connections for node {node_url}: {e}")
+        # else:
+        #     logger.info(f"No new connections required for node {node_url} based on current rules.")
 
     def remove(self, node_url: str):
         """Remove a node."""
@@ -439,7 +604,7 @@ def node_status():
 
 
 @app.post('/nodes/add', dependencies=[Depends(check_api_key)])
-def add_node(node: Node, raw_request: Request = None):
+async def add_node(node: Node, background_tasks: BackgroundTasks, raw_request: Request = None):
     """Add a node to the manager.
 
     - url (str): A http url. Can be the url generated by
@@ -449,11 +614,16 @@ def add_node(node: Node, raw_request: Request = None):
         RPM or other metric. All the values of nodes should be the same metric.
     """
     try:
-        res = node_manager.add(node.url, node.status)
-        if res is not None:
-            logger.error(f'add node {node.url} failed, {res}')
-            return res
+        err_resp, status = await node_manager.add(node.url, node.status)
+        if err_resp is not None:
+            logger.error(f'add node {node.url} failed, {err_resp}')
+            return err_resp
         logger.info(f'add node {node.url} successfully')
+        background_tasks.add_task(
+            node_manager.establish_peer_connections_delayed,
+            node.url,
+            status  # Pass the returned status object
+        )
         return 'Added successfully'
     except:  # noqa
         return 'Failed to add, please check the input url.'
