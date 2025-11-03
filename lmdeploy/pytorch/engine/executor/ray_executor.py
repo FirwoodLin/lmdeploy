@@ -594,7 +594,7 @@ class RayExecutor(ExecutorBase):
         return await asyncio.gather(*jobs)
 
     async def epd_migrate(self, batch: MigrationExecutionBatch):
-        jobs = (worker.ep_migrate.remote(batch) for worker in self.workers)
+        jobs = (worker.epd_migrate.remote(batch) for worker in self.workers)
         return await asyncio.gather(*jobs)
 
     """ PD Disaggregation API Begin """

@@ -185,4 +185,7 @@ class WorkerWrapperBase:
     async def migrate(self, inputs: MigrationExecutionBatch):
         return await self.model_agent.cache_engine.migrate(inputs)
 
+    async def epd_migrate(self, inputs: MigrationExecutionBatch):
+        return await self.model_agent.cache_engine.epd_migrate(inputs)
+
     """ PD Disaggregation API End """
