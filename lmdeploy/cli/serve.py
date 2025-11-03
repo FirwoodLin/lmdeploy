@@ -91,6 +91,7 @@ class SubCliServe:
         ArgumentHelper.device(pt_group)
         ArgumentHelper.eager_mode(pt_group)
         ArgumentHelper.disable_vision_encoder(pt_group)
+        ArgumentHelper.with_llm(pt_group)
         ArgumentHelper.logprobs_mode(pt_group)
         ArgumentHelper.dllm_block_length(pt_group)
         ArgumentHelper.dllm_unmasking_strategy(pt_group)
@@ -227,6 +228,7 @@ class SubCliServe:
                 dllm_unmasking_strategy=args.dllm_unmasking_strategy,
                 dllm_denoising_steps=args.dllm_denoising_steps,
                 dllm_confidence_threshold=args.dllm_confidence_threshold,
+                with_llm=args.with_llm,
             )
         else:
             from lmdeploy.messages import TurbomindEngineConfig

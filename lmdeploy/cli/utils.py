@@ -616,6 +616,21 @@ class ArgumentHelper:
                                    help='enable metrics system')
 
     @staticmethod
+    def with_llm(parser, default: bool = True):
+        """Control whether to load the language model weights."""
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument('--with-llm',
+                           dest='with_llm',
+                           action='store_true',
+                           default=default,
+                           help='Load language model weights alongside the encoder.')
+        group.add_argument('--without-llm',
+                           dest='with_llm',
+                           action='store_false',
+                           help='Skip loading language model weights for encoder-only serving.')
+        return group
+
+    @staticmethod
     def logprobs_mode(parser):
         """The mode of logprobs."""
         return parser.add_argument('--logprobs-mode',

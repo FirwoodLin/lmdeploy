@@ -383,6 +383,7 @@ class PytorchEngineConfig:
     dllm_unmasking_strategy: str = 'low_confidence_dynamic'
     dllm_denoising_steps: int = None
     dllm_confidence_threshold: float = 0.85
+    with_llm: bool = True
 
     role: EngineRole = EngineRole.Hybrid
     migration_backend: MigrationBackend = MigrationBackend.DLSlime

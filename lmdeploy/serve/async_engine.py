@@ -255,6 +255,7 @@ class AsyncEngine(LogitsMixin):
 
         backend_config = backend_config or (TurbomindEngineConfig()
                                             if backend == 'turbomind' else PytorchEngineConfig())
+        self.llm_enabled = getattr(backend_config, 'with_llm', True)
         self.model_name = model_name if model_name else model_path
         chat_template_name = best_match_model(model_path)
         if chat_template_config is None:
@@ -271,16 +272,21 @@ class AsyncEngine(LogitsMixin):
         self.session_len = (_get_and_verify_max_len(cfg, None)
                             if backend_config.session_len is None else backend_config.session_len)
         backend_config.session_len = self.session_len
-        # build backend engine
-        if backend == 'turbomind':
-            self.engine = self._build_turbomind(model_path=model_path, backend_config=backend_config, **kwargs)
-            self.hf_tm_cfg = self.engine.config
-        elif backend == 'pytorch':
-            self.engine = self._build_pytorch(model_path=model_path, backend_config=backend_config, **kwargs)
-            self.hf_tm_cfg = getattr(self.engine.model_config, 'hf_config', None)
-        else:
+        self.engine = None
+        self.hf_tm_cfg = None
+        if backend not in ['turbomind', 'pytorch']:
             raise ValueError(f'unsupported backend {backend}')
-        self.backend_config = self.engine.engine_config
+
+        if self.llm_enabled:
+            if backend == 'turbomind':
+                self.engine = self._build_turbomind(model_path=model_path, backend_config=backend_config, **kwargs)
+                self.hf_tm_cfg = self.engine.config
+            else:  # backend == 'pytorch'
+                self.engine = self._build_pytorch(model_path=model_path, backend_config=backend_config, **kwargs)
+                self.hf_tm_cfg = getattr(self.engine.model_config, 'hf_config', None)
+            self.backend_config = self.engine.engine_config
+        else:
+            self.backend_config = backend_config
         logger.info(f'updated backend_config={self.backend_config}')
 
         # parameters for member functions
@@ -288,11 +294,14 @@ class AsyncEngine(LogitsMixin):
         if self.stop_words is not None:
             self.stop_words = self.stop_words[0][0].tolist()
         self.backend = backend
-        self.instance_num = self.backend_config.max_batch_size
+        self.instance_num = self.backend_config.max_batch_size if self.llm_enabled else 0
+        if self.instance_num is None:
+            self.instance_num = 0
         self.id2step = {}
         self.id2inst = {}
         self.free_insts: asyncio.Queue = None
-        self.instances = [self.engine.create_instance() for _ in range(self.instance_num)]
+        self.instances = ([self.engine.create_instance() for _ in range(self.instance_num)]
+                          if self.llm_enabled else [])
         self._session_id = count(0)
         self.request_logger = RequestLogger(max_log_len)
         self.internal_thread = _EventLoopThread(daemon=True)
@@ -305,7 +314,8 @@ class AsyncEngine(LogitsMixin):
         self.internal_thread.close()
         self.free_insts = None
         self.instances.clear()
-        self.engine.close()
+        if self.engine:
+            self.engine.close()
 
     def __enter__(self):
         return self
@@ -340,6 +350,9 @@ class AsyncEngine(LogitsMixin):
     def _build_stat_loggers(self):
         self.stat_loggers = []
 
+        if not self.llm_enabled or self.engine is None:
+            return
+
         if getattr(self.backend_config, 'enable_metrics', False):
             from lmdeploy.metrics.loggers import LoggingStatLogger, PrometheusStatLogger
             dp_rank = self.backend_config.dp_rank if self.backend_config.dp > 1 else 0
@@ -354,6 +367,8 @@ class AsyncEngine(LogitsMixin):
             metrics_processor.stat_loggers = self.stat_loggers
 
     def get_schedule_metrics(self):
+        if not self.engine or not hasattr(self.engine, 'get_schedule_metrics'):
+            return {}
         return self.engine.get_schedule_metrics()
 
     def __call__(self,
@@ -696,6 +711,8 @@ class AsyncEngine(LogitsMixin):
             do_preprocess (bool): whether pre-process the messages. Default to
                 True, which means chat_template will be applied.
         """
+        if not self.llm_enabled:
+            raise RuntimeError('LLM generation is disabled because `with_llm=False`.')
         if (messages is not None) ^ (input_ids is None):
             raise ValueError('You must specify exactly one of messages or input_ids')
         if session_id not in self.id2step:
@@ -1048,18 +1065,27 @@ class AsyncEngine(LogitsMixin):
     """ DistServe Async Engine API Begin """
 
     def free_cache(self, session_id: int):
+        if not self.engine or not hasattr(self.engine, 'end_session'):
+            logger.debug('skip free_cache because llm engine is disabled or unsupported.')
+            return
         if self.engine.end_session(session_id):
             logger.debug(f'successfully free session {session_id}')
         else:
             logger.warning(f'Invalid Free session {session_id}.')
 
     def p2p_initialize(self, init_request: DistServeInitRequest):
+        if not self.engine or not hasattr(self.engine, 'p2p_initialize'):
+            raise RuntimeError('p2p_initialize is unavailable because llm engine is disabled.')
         return self.engine.p2p_initialize(init_request)
 
     def p2p_connect(self, conn_request: List[DistServeConnectionRequest]):
+        if not self.engine or not hasattr(self.engine, 'p2p_connect'):
+            raise RuntimeError('p2p_connect is unavailable because llm engine is disabled.')
         return self.engine.p2p_connect(conn_request)
 
     def p2p_drop_connect(self, drop_conn_request: List[DistServeDropConnectionRequest]):
+        if not self.engine or not hasattr(self.engine, 'p2p_drop_connect'):
+            raise RuntimeError('p2p_drop_connect is unavailable because llm engine is disabled.')
         return self.engine.p2p_drop_connect(drop_conn_request)
 
     """ DistServe Async Engine API End """
