@@ -13,7 +13,6 @@ from lmdeploy.pytorch.disagg.conn.protocol import (DistServeCacheFreeRequest, Di
                                                    DistServeDropConnectionRequest, DistServeEngineEndpointInfo,
                                                    DistServeInitRequest, DistServeInitResponse,
                                                    DistServeKVTransferEndpointInfo)
-from lmdeploy.pytorch.engine.executor.dist_utils import find_available_port
 
 if TYPE_CHECKING:
     from lmdeploy.pytorch.engine.engine import Engine
@@ -34,6 +33,8 @@ class EngineP2PConnection:
     async def p2p_initialize(self, init_request: DistServeInitRequest):
         ctx = zmq.asyncio.Context(2)
         sender = ctx.socket(zmq.PUSH)
+        from lmdeploy.pytorch.engine.executor.dist_utils import find_available_port
+        
         sender_port = find_available_port()
         sender_hostname = urlparse(init_request.local_engine_id).hostname
         zmq_address = f'tcp://{sender_hostname}:{sender_port}'
